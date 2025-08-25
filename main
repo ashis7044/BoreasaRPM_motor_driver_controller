@@ -1,0 +1,528 @@
+// MULTI-SENSOR (CF XGZP6859D + NXP MP3V5004GP + Honeywell MPR) DATA LOGGER
+// =========================================================================
+// Combines:
+//  * CF XGZP6859D (I2C) absolute / differential pressure sensor
+//  * NXP MP3V5004GP (Analog) pressure sensor
+//  * Honeywell MPR (MPRLS0001PG00001C) 0-1 psi digital pressure sensor (I2C)
+// Outputs CSV data for Python logging (all pressures in cmH2O).
+// NOTE: Previous blower control code (Nidec TF029B) has been deprecated and is
+// fully commented out below to preserve reference while disabling functionality.
+// Meant for use with Arduino Uno R4 Minima and python_app/cf_nxp_hw_sensor_logger.py
+// Recommended to program with PlatformIO
+// =========================================================================
+
+#include <Arduino.h>
+#include <Wire.h>
+
+// =========================================================================
+// XGZP6859D SENSOR CONFIGURATION
+// =========================================================================
+
+// The 7-bit I2C address for the XGZP6859D sensor is 0x6D.
+#define SENSOR_I2C_ADDRESS 0x6D
+
+// For a 0-5 kPa sensor. Datasheet pg. 8 states k value is 1024.
+const int K_VALUE = 1024;
+
+// =========================================================================
+// XGZP6859D SENSOR REGISTERS
+// =========================================================================
+const byte CONVERSION_CMD_REG = 0x30;
+const byte START_CONVERSION_CMD = 0x0A; // Command for combined Temp & Pressure
+const byte PRESSURE_DATA_REG = 0x06;    // Start address for 3 pressure bytes
+// Number of samples to average
+#define NUM_SAMPLES 20
+
+// =========================================================================
+// (DEPRECATED) BLOWER CONTROL CONFIGURATION - COMMENTED OUT
+// =========================================================================
+/*
+// Pin definitions for blower control
+const int DAC_PIN = A0;        // PWM output for blower speed control
+const int FG_PIN = 2;          // Feedback signal from blower
+const int BRAKE_PIN = 3;       // Brake control pin
+const int ERROR_PIN = 4;       // Error signal from blower
+
+// Blower constants
+const int REVS_PER_PULSE = 10;
+volatile unsigned long fgPulseCount = 0;
+unsigned long lastRpmTime = 0;
+float currentRpm = 0;
+
+// Blower control variables
+int targetRpm = 0;
+float targetCntVoltage = 0.0;
+bool brakeActive = false;
+*/
+// =========================================================================
+// HONEYWELL MPR (MPRLS0001PG00001C) SENSOR CONFIGURATION
+// =========================================================================
+// Typical 7-bit I2C address for Honeywell MPR pressure sensor family
+#define MPR_I2C_ADDRESS 0x18
+// Output transfer function (per datasheet): Counts span 1638 (10%) to 14745 (90%) for full scale
+const float MPR_OUTPUT_MIN = 1638.0f;   // 10% of 2^14
+const float MPR_OUTPUT_MAX = 14745.0f;  // 90% of 2^14
+const float MPR_P_MIN_PSI = 0.0f;
+const float MPR_P_MAX_PSI = 1.0f;       // Device full scale (1 psi)
+// Conversion: 1 psi = 70.307 cmH2O
+const float PSI_TO_CMH2O = 70.307f;
+// Number of samples to average for MPR reading to reduce noise
+#define MPR_AVG_SAMPLES 5
+// Zero calibration enable
+const bool ENABLE_MPR_ZERO_CAL = true;
+float mpr_zero_offset = 0.0f; // in cmH2O
+
+// =========================================================================
+// MP3V5004GP SENSOR CONFIGURATION
+// =========================================================================
+
+// The analog pin connected to the MP3V5004GP sensor's output (moved to A1 due to DAC conflict)
+const int analogSensorPin = A1;
+
+// The number of samples to average for MP3V5004GP readings
+const int analogNumSamples = 25;
+
+// Arduino ADC reference voltage (5V for R4 Minima)
+const float adcReference = 5.0;
+
+// ADC resolution (14-bit for R4 Minima)
+const float adcResolution = 16383.0;
+
+// The supply voltage to the MP3V5004GP sensor (3.3V)
+const float supplyVoltage = 3.3;
+
+// Conversion factor from kPa to cmH2O
+const float kpa_to_cmH2O = 10.197;
+
+// Option to enable dynamic offset for MP3V5004GP readings
+const bool ENABLE_DYNAMIC_OFFSET = false;
+// Options to enable zero calibration for each sensor
+const bool ENABLE_XGZP_ZERO_CAL = true;
+const bool ENABLE_MP3_ZERO_CAL = true;
+
+// =========================================================================
+// FORWARD DECLARATIONS
+// =========================================================================
+bool checkSensorConnection();
+bool startConversion();
+bool readSensorData(float &pressure, float &temperature);
+// Number of samples for zero offset measurement
+#define ZERO_OFFSET_SAMPLES 100
+// Zero offset values for sensors
+float xgzp_zero_offset = 0.0;
+float mp3_zero_offset = 0.0;
+float getDynamicOffset(float rawPressure);
+float readMP3V5004GP();
+bool readMPR(float &pressure_cmH2O, float &temperatureC);
+
+// (Deprecated) Blower control function declarations (commented out)
+/*
+void countFgPulse();
+void sendDataUpdate();
+void setSpeedByRpm(int rpm);
+void setSpeedByVoltage(float voltage);
+void checkFatalError();
+void handleSerialCommands();
+*/
+
+// =========================================================================
+// SETUP
+// =========================================================================
+void setup() {
+  Serial.begin(115200);
+  while (!Serial) {
+    delay(10); // Wait for serial port to connect
+  }
+  delay(100); // Small delay for sensor power-up
+
+  Serial.println("\nTriple Sensor Data Logger");
+  Serial.println("XGZP6859D (I2C) + MP3V5004GP (Analog) + Honeywell MPR (I2C)");
+  Serial.println("----------------------------------------------------------------");
+
+  // Set the ADC resolution to 14-bit for the Arduino R4 Minima
+  analogReadResolution(14);
+  
+  // Set PWM resolution to 12-bit for blower control
+  analogWriteResolution(12);
+
+  // Initialize I2C for XGZP6859D sensor
+  Wire.begin();
+  Wire.setClock(100000); // 100kHz I2C clock speed
+
+  // (Blower hardware disabled - pins not configured)
+
+  // Check that we can still see the XGZP6859D sensor before starting
+  if (!checkSensorConnection()) {
+    Serial.println("ERROR: Lost connection to the XGZP6859D sensor at 0x6D.");
+    Serial.println("Please check wiring and reset the board.");
+    while (1) { delay(1000); } // Halt execution
+  }
+  
+  Serial.println("XGZP6859D sensor connection confirmed.");
+  Serial.print("Using K-Value: ");
+  Serial.println(K_VALUE);
+
+  // Zero calibration for each sensor
+  if (ENABLE_XGZP_ZERO_CAL) {
+    Serial.println("Calibrating XGZP zero offset...");
+    float sumXgzp = 0;
+    int countX = 0;
+    for (int i = 0; i < ZERO_OFFSET_SAMPLES; i++) {
+      if (startConversion()) {
+        delay(20);
+        float p, t;
+        if (readSensorData(p, t)) {
+          sumXgzp += p / 98.0665;
+          countX++;
+        }
+      }
+      delay(10);
+    }
+    xgzp_zero_offset = (countX > 0) ? sumXgzp / countX : 0;
+    Serial.print("XGZP zero offset: "); Serial.println(xgzp_zero_offset, 4);
+  } else {
+    xgzp_zero_offset = 0;
+    Serial.println("XGZP zero calibration disabled.");
+  }
+  
+  if (ENABLE_MP3_ZERO_CAL) {
+    Serial.println("Calibrating MP3 zero offset...");
+    float sumMp3 = 0;
+    for (int i = 0; i < ZERO_OFFSET_SAMPLES; i++) {
+      sumMp3 += readMP3V5004GP();
+      delay(10);
+    }
+    mp3_zero_offset = sumMp3 / ZERO_OFFSET_SAMPLES;
+    Serial.print("MP3 zero offset: "); Serial.println(mp3_zero_offset, 4);
+  } else {
+    mp3_zero_offset = 0;
+    Serial.println("MP3 zero calibration disabled.");
+  }
+
+  // Zero calibration for MPR sensor (read several samples at zero pressure)
+  if (ENABLE_MPR_ZERO_CAL) {
+    Serial.println("Calibrating MPR zero offset...");
+    float sumMpr = 0; int mprCount = 0;
+    for (int i = 0; i < ZERO_OFFSET_SAMPLES; i++) {
+      float p_cmh2o, tC;
+      if (readMPR(p_cmh2o, tC)) { sumMpr += p_cmh2o; mprCount++; }
+      delay(10);
+    }
+    mpr_zero_offset = (mprCount > 0) ? sumMpr / mprCount : 0.0f;
+    Serial.print("MPR zero offset: "); Serial.println(mpr_zero_offset, 4);
+  } else {
+    mpr_zero_offset = 0.0f;
+    Serial.println("MPR zero calibration disabled.");
+  }
+
+  Serial.println("\n--- Starting Triple Sensor System ---");
+  Serial.println("CSV Format: XGZP_Pressure_cmH2O,XGZP_Temperature_C,MP3V_Pressure_cmH2O,MPR_Pressure_cmH2O");
+  Serial.println("READY"); // Signal to Python that Arduino is ready
+}
+
+// =========================================================================
+// MAIN LOOP
+// =========================================================================
+void loop() {
+  // (Deprecated) Blower control logic removed
+  
+  // Arrays to hold recent samples for XGZP6859D
+  static float pressure_samples[NUM_SAMPLES];
+  static float temperature_samples[NUM_SAMPLES];
+  float pressure, temperature;
+
+  // Collect NUM_SAMPLES readings from XGZP6859D
+  for (int i = 0; i < NUM_SAMPLES; i++) {
+    if (startConversion()) {
+      delay(20); // wait for conversion
+      if (readSensorData(pressure, temperature)) {
+        // convert pressure to cmH2O
+        pressure_samples[i] = pressure / 98.0665;
+        temperature_samples[i] = temperature;
+      } else {
+        pressure_samples[i] = NAN;
+        temperature_samples[i] = NAN;
+      }
+    } else {
+      pressure_samples[i] = NAN;
+      temperature_samples[i] = NAN;
+    }
+    delay(10); // spacing between samples
+  }
+
+  // Compute averages for XGZP6859D, ignoring invalid samples
+  float sumP = 0, sumT = 0;
+  int countP = 0, countT = 0;
+  for (int i = 0; i < NUM_SAMPLES; i++) {
+    if (!isnan(pressure_samples[i])) { sumP += pressure_samples[i]; countP++; }
+    if (!isnan(temperature_samples[i])) { sumT += temperature_samples[i]; countT++; }
+  }
+  float avgP_XGZP = (countP > 0) ? sumP / countP : NAN;
+  float avgT_XGZP = (countT > 0) ? sumT / countT : NAN;
+
+  // Read MP3V5004GP pressure
+  float mp3v_calibrated = readMP3V5004GP();
+
+  // Read Honeywell MPR (average a few samples)
+  float mpr_pressure_sum = 0; int mpr_valid = 0; float mpr_temp_last = NAN;
+  for (int i = 0; i < MPR_AVG_SAMPLES; i++) {
+    float p_cmh2o, tC;
+    if (readMPR(p_cmh2o, tC)) { mpr_pressure_sum += p_cmh2o; mpr_temp_last = tC; mpr_valid++; }
+    delay(5);
+  }
+  float mpr_avg_cmh2o = (mpr_valid > 0) ? (mpr_pressure_sum / mpr_valid) : NAN;
+
+  // Apply zero offset corrections
+  float corrP = !isnan(avgP_XGZP) ? (avgP_XGZP - xgzp_zero_offset) : NAN;
+  float corrMp3 = !isnan(mp3v_calibrated) ? (mp3v_calibrated - mp3_zero_offset) : NAN;
+  float corrMpr = !isnan(mpr_avg_cmh2o) ? (mpr_avg_cmh2o - mpr_zero_offset) : NAN;
+
+  // Print unified CSV data: XGZP_Pressure_cmH2O,XGZP_Temperature_C,MP3V_Pressure_cmH2O,MPR_Pressure_cmH2O
+  if (!isnan(corrP)) {
+    Serial.print(corrP, 4);
+  } else {
+    Serial.print("NAN");
+  }
+  Serial.print(",");
+  
+  if (!isnan(avgT_XGZP)) {
+    Serial.print(avgT_XGZP, 2);
+  } else {
+    Serial.print("NAN");
+  }
+  Serial.print(",");
+  
+  if (!isnan(corrMp3)) {
+    Serial.print(corrMp3, 4);
+  } else {
+    Serial.print("NAN");
+  }
+  Serial.print(",");
+
+  if (!isnan(corrMpr)) {
+    Serial.print(corrMpr, 4);
+  } else {
+    Serial.print("NAN");
+  }
+  Serial.println();
+  
+  delay(100); // Small delay between main loop iterations
+}
+
+// =========================================================================
+// SENSOR HELPER FUNCTIONS
+// =========================================================================
+
+/**
+ * @brief Pings the sensor's I2C address to ensure it's connected.
+ * @return true if the sensor acknowledges, false otherwise.
+ */
+bool checkSensorConnection() {
+  Wire.beginTransmission(SENSOR_I2C_ADDRESS);
+  return (Wire.endTransmission() == 0);
+}
+
+/**
+ * @brief Sends the command to start a pressure and temperature conversion.
+ * @return true if the command was acknowledged, false otherwise.
+ */
+bool startConversion() {
+  Wire.beginTransmission(SENSOR_I2C_ADDRESS);
+  Wire.write(CONVERSION_CMD_REG);   // Register address to write to
+  Wire.write(START_CONVERSION_CMD); // Command to write
+  byte status = Wire.endTransmission();
+
+  if (status != 0) {
+    Serial.print("Error sending conversion command. I2C status: ");
+    Serial.println(status);
+    return false;
+  }
+  return true;
+}
+
+/**
+ * @brief Reads the latest pressure and temperature data from the sensor.
+ * @param pressure Reference to a float to store the pressure value in Pa.
+ * @param temperature Reference to a float to store the temperature value in C.
+ * @return true if data was read and calculated successfully, false otherwise.
+ */
+bool readSensorData(float &pressure, float &temperature) {
+  // We need to read 5 bytes total:
+  // - 3 bytes for pressure (from register 0x06, 0x07, 0x08)
+  // - 2 bytes for temperature (from register 0x09, 0x0A)
+  const byte bytesToRead = 5;
+  byte data[bytesToRead];
+  
+  // First, set the register pointer to the start of the pressure data (0x06)
+  Wire.beginTransmission(SENSOR_I2C_ADDRESS);
+  Wire.write(PRESSURE_DATA_REG);
+  // endTransmission(false) sends a restart, keeping the connection active for reading
+  byte status = Wire.endTransmission(false); 
+  
+  if (status != 0) {
+    Serial.print("Error setting read pointer. I2C status: ");
+    Serial.println(status);
+    return false;
+  }
+
+  // Now, request the 5 bytes from the sensor
+  int bytesRead = Wire.requestFrom((uint8_t)SENSOR_I2C_ADDRESS, (uint8_t)bytesToRead);
+
+  // (Deprecated) Blower functions removed.
+
+  // =========================================================================
+  // HONEYWELL MPR SENSOR FUNCTIONS
+  // =========================================================================
+  bool readMPR(float &pressure_cmH2O, float &temperatureC) {
+    pressure_cmH2O = NAN;
+    temperatureC = NAN;
+
+    // Request 4 bytes from the sensor
+    Wire.beginTransmission(MPR_I2C_ADDRESS);
+    if (Wire.endTransmission(false) != 0) {
+      return false; // Device did not ACK
+    }
+    int bytesRead = Wire.requestFrom((uint8_t)MPR_I2C_ADDRESS, (uint8_t)4);
+    if (bytesRead != 4) return false;
+
+    byte b1 = Wire.read();
+    byte b2 = Wire.read();
+    byte b3 = Wire.read();
+    byte b4 = Wire.read();
+
+    uint8_t status = (b1 & 0xC0) >> 6; // Status bits (00 = normal)
+    if (status != 0) {
+      return false; // Data not ready / error
+    }
+
+    uint16_t p_counts = ((uint16_t)(b1 & 0x3F) << 8) | b2; // 14-bit pressure
+    uint16_t t_counts = ((uint16_t)b3 << 3) | (b4 >> 5);    // 11-bit temperature
+
+    // Convert counts to pressure in psi
+    float pressure_psi = ( ( (float)p_counts - MPR_OUTPUT_MIN) * (MPR_P_MAX_PSI - MPR_P_MIN_PSI) / (MPR_OUTPUT_MAX - MPR_OUTPUT_MIN) ) + MPR_P_MIN_PSI;
+    if (pressure_psi < 0) pressure_psi = 0; // Clamp small negative due to noise
+    pressure_cmH2O = pressure_psi * PSI_TO_CMH2O;
+
+    // Temperature (per datasheet): counts * (200 / 2047) - 50 => range -50..150 C
+    temperatureC = ((float)t_counts * 200.0f / 2047.0f) - 50.0f;
+    return true;
+  }
+
+  // Apply the dynamic calibration only if enabled
+  float calibratedPressure = rawPressure_cmH2O - dynamicOffset;
+
+  // Return pressure with or without dynamic offset
+  if (ENABLE_DYNAMIC_OFFSET) {
+    return calibratedPressure;
+  } else {
+    return rawPressure_cmH2O;
+  }
+}
+
+// =========================================================================
+// BLOWER CONTROL FUNCTIONS
+// =========================================================================
+
+/**
+ * @brief Interrupt service routine for counting FG pulses from blower.
+ */
+void countFgPulse() {
+  fgPulseCount++;
+}
+
+/**
+ * @brief Sets blower speed by target RPM.
+ * @param rpm Target RPM (0-50000).
+ */
+void setSpeedByRpm(int rpm) {
+  targetRpm = constrain(rpm, 0, 50000);
+  if (targetRpm < 10000) {
+    targetCntVoltage = 0.0;
+  } else {
+    targetCntVoltage = map(targetRpm, 10000, 50000, 500, 4500) / 1000.0;
+  }
+  setSpeedByVoltage(targetCntVoltage);
+}
+
+/**
+ * @brief Sets blower speed by control voltage.
+ * @param voltage Target control voltage (0.0-4.5V).
+ */
+void setSpeedByVoltage(float voltage) {
+  targetCntVoltage = constrain(voltage, 0.0, 4.5);
+  
+  float dacCommandVoltage = targetCntVoltage + 0.10; // DAC calibration
+  dacCommandVoltage = constrain(dacCommandVoltage, 0.0, 5.0);
+  
+  int dacValue = map(dacCommandVoltage * 1000, 0, 5000, 0, 4095);
+  dacValue = constrain(dacValue, 0, 4095);
+  
+  analogWrite(DAC_PIN, dacValue);
+
+  if (targetCntVoltage < 0.5) {
+    targetRpm = 0;
+  } else {
+    targetRpm = map(targetCntVoltage * 100, 50, 450, 10000, 50000);
+  }
+}
+
+/**
+ * @brief Checks for fatal error from blower and halts if detected.
+ */
+void checkFatalError() {
+  if (digitalRead(ERROR_PIN) == LOW) {
+    setSpeedByVoltage(0);
+    digitalWrite(BRAKE_PIN, HIGH);
+    Serial.println("ERROR,FATAL_ERROR_DETECTED");
+    while (1) {
+      delay(1000);
+    }
+  }
+}
+
+/**
+ * @brief Handles serial commands for blower control.
+ */
+void handleSerialCommands() {
+  if (Serial.available() > 0) {
+    String command = Serial.readStringUntil('\n');
+    command.trim();
+
+    if (command.startsWith("s")) {
+      int rpm = command.substring(1).toInt();
+      setSpeedByRpm(rpm);
+      Serial.println("ACK,RPM_SET");
+    } 
+    else if (command.startsWith("v")) {
+      float voltage = command.substring(1).toFloat();
+      setSpeedByVoltage(voltage);
+      Serial.println("ACK,VOLTAGE_SET");
+    }
+    else if (command.equalsIgnoreCase("brake_on")) {
+      brakeActive = true;
+      digitalWrite(BRAKE_PIN, HIGH);
+      Serial.println("ACK,BRAKE_ON");
+    }
+    else if (command.equalsIgnoreCase("brake_off")) {
+      brakeActive = false;
+      digitalWrite(BRAKE_PIN, LOW);
+      Serial.println("ACK,BRAKE_OFF");
+    }
+    else if (command.equalsIgnoreCase("stop")) {
+      setSpeedByVoltage(0);
+      Serial.println("ACK,STOPPED");
+    }
+    else if (command.equalsIgnoreCase("status")) {
+      Serial.print("STATUS,");
+      Serial.print(targetRpm);
+      Serial.print(",");
+      Serial.print(currentRpm, 0);
+      Serial.print(",");
+      Serial.print(targetCntVoltage, 2);
+      Serial.print(",");
+      Serial.print(brakeActive ? "ON" : "OFF");
+      Serial.print(",");
+      Serial.println(digitalRead(ERROR_PIN) == LOW ? "ERROR" : "OK");
+    }
+  }
+}
