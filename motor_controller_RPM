@@ -1,0 +1,76 @@
+/*
+ * ===================================================================================
+ * Simple RPM Monitor for Boreasa Blower with M2+E2 Driver
+ *
+ * >>>>> Specifically for Arduino Uno R4 Minima <<<<<
+ * ===================================================================================
+ * This code reads the FG/Tacho signal from the driver and prints the
+ * current RPM to the Serial Monitor.
+ *
+ * It does NOT control the speed. Speed must be set manually using the
+ * internal blue potentiometer on the M2 board.
+ *
+ * Created based on Boreasa M2, E2, and C45S1 datasheets.
+ */
+
+// --- Pin Definition ---
+// The only signal pin needed from the driver.
+const int TACHO_PIN = 2;      // Speed feedback (FG). Connect directly to M2 Pin 15 (FG).
+
+// --- Blower & RPM Calculation Constants ---
+// The CS45S1 is a 2-pole motor, which means it has 1 pole pair.
+const int NUM_POLE_PAIRS = 1;
+
+// --- Global Variables ---
+volatile unsigned long tachoPulseCount = 0; // 'volatile' is crucial for variables used in an ISR.
+unsigned long lastRpmReadTime = 0;
+float currentRpm = 0.0;
+
+// --- Interrupt Service Routine (ISR) ---
+// This function runs automatically every time a pulse is detected on TACHO_PIN.
+void countTachoPulse() {
+  tachoPulseCount++;
+}
+
+// ===================================================================================
+// SETUP: Runs once when the Arduino powers on or resets.
+// ===================================================================================
+void setup() {
+  Serial.begin(115200);
+  while (!Serial);
+
+  // Configure the Tacho pin to listen for pulses from the driver.
+  pinMode(TACHO_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(TACHO_PIN), countTachoPulse, RISING);
+
+  Serial.println("Arduino RPM Monitor Initialized.");
+  Serial.println("---------------------------------");
+  Serial.println("Controlling speed via M2 board's internal potentiometer.");
+  Serial.println("Actual RPM will be displayed below:");
+}
+
+// ===================================================================================
+// LOOP: Runs continuously after setup() is complete.
+// ===================================================================================
+void loop() {
+  // Calculate and display the current RPM once per second.
+  if (millis() - lastRpmReadTime >= 1000) {
+    // To safely read the pulse count, we temporarily disable interrupts.
+    noInterrupts();
+    unsigned long pulseCount = tachoPulseCount;
+    tachoPulseCount = 0; // Reset the counter for the next second.
+    interrupts();
+
+    // The frequency in Hz is the number of pulses counted in our 1-second interval.
+    float frequencyHz = pulseCount;
+
+    // Use the formula from the E2 datasheet: n = (f_FG * 20) / Z_pol
+    currentRpm = (frequencyHz * 20.0) / NUM_POLE_PAIRS;
+
+    Serial.print("Actual Speed: ");
+    Serial.print(currentRpm);
+    Serial.println(" RPM");
+
+    lastRpmReadTime = millis(); // Reset the timer for the next reading.
+  }
+}
