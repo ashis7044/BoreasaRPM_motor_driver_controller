@@ -1,2 +1,2 @@
-# BoreasaRPM_motor_driver_controller
+# CFsensor
 BoreasaRPM_motor_driver_controller using Arduino
